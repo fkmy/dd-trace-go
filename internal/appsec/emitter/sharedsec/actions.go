@@ -9,12 +9,14 @@ import (
 	_ "embed" // Blank import
 	"net/http"
 	"os"
+	"path"
 	"strings"
 
 	"gopkg.in/DataDog/dd-trace-go.v1/appsec/events"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec/dyngo"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/log"
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/stacktrace"
+	urlpkg "net/url"
 
 	"github.com/mitchellh/mapstructure"
 )
@@ -57,6 +59,11 @@ type (
 	// HTTPAction are actions that interact with an HTTP request flow (block, redirect...)
 	HTTPAction struct {
 		http.Handler
+
+		StatusCode       int
+		RedirectLocation string
+		// BlockingTemplate is a function that returns the headers to be added and body to be written to the response
+		BlockingTemplate func(headers map[string][]string) (map[string][]string, []byte)
 	}
 	// GRPCAction are actions that interact with a GRPC request flow
 	GRPCAction struct {
@@ -144,12 +151,15 @@ func NewRedirectAction(params map[string]any) *HTTPAction {
 }
 
 func newHTTPBlockRequestAction(status int, template string) *HTTPAction {
-	return &HTTPAction{Handler: newBlockHandler(status, template)}
+	return &HTTPAction{
+		Handler:          newBlockHandler(status, template),
+		StatusCode:       status,
+		BlockingTemplate: newManualBlockHandler(template),
+	}
 }
 
 func newGRPCBlockRequestAction(status int) *GRPCAction {
 	return &GRPCAction{GRPCWrapper: newGRPCBlockHandler(status)}
-
 }
 
 func newRedirectRequestAction(status int, loc string) *HTTPAction {
@@ -160,9 +170,17 @@ func newRedirectRequestAction(status int, loc string) *HTTPAction {
 
 	// If location is not set we fall back on a default block action
 	if loc == "" {
-		return &HTTPAction{Handler: newBlockHandler(403, string(blockedTemplateJSON))}
+		return &HTTPAction{
+			Handler:          newBlockHandler(403, string(blockedTemplateJSON)),
+			StatusCode:       403,
+			BlockingTemplate: newManualBlockHandler("json"),
+		}
 	}
-	return &HTTPAction{Handler: http.RedirectHandler(loc, status)}
+	return &HTTPAction{
+		Handler:          http.RedirectHandler(loc, status),
+		StatusCode:       status,
+		RedirectLocation: loc,
+	}
 }
 
 // newBlockHandler creates, initializes and returns a new BlockRequestAction
@@ -176,16 +194,47 @@ func newBlockHandler(status int, template string) http.Handler {
 		return htmlHandler
 	default:
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			h := jsonHandler
-			hdr := r.Header.Get("Accept")
-			htmlIdx := strings.Index(hdr, "text/html")
-			jsonIdx := strings.Index(hdr, "application/json")
-			// Switch to html handler if text/html comes before application/json in the Accept header
-			if htmlIdx != -1 && (jsonIdx == -1 || htmlIdx < jsonIdx) {
-				h = htmlHandler
-			}
-			h.ServeHTTP(w, r)
+			h := findCorrectTemplate(jsonHandler, htmlHandler, r.Header.Get("Accept"))
+			h.(http.Handler).ServeHTTP(w, r)
 		})
+	}
+}
+
+func newManualBlockHandler(template string) func(headers map[string][]string) (map[string][]string, []byte) {
+	htmlHandler := newManualBlockDataHandler("text/html", blockedTemplateHTML)
+	jsonHandler := newManualBlockDataHandler("application/json", blockedTemplateJSON)
+	switch template {
+	case "json":
+		return jsonHandler
+	case "html":
+		return htmlHandler
+	default:
+		return func(headers map[string][]string) (map[string][]string, []byte) {
+			acceptHeader := ""
+			if hdr, ok := headers["accept"]; ok && len(hdr) > 0 {
+				acceptHeader = hdr[0]
+			}
+			h := findCorrectTemplate(jsonHandler, htmlHandler, acceptHeader)
+			return h.(func(headers map[string][]string) (map[string][]string, []byte))(headers)
+		}
+	}
+}
+
+func findCorrectTemplate(jsonHandler interface{}, htmlHandler interface{}, acceptHeader string) interface{} {
+	h := jsonHandler
+	hdr := acceptHeader
+	htmlIdx := strings.Index(hdr, "text/html")
+	jsonIdx := strings.Index(hdr, "application/json")
+	// Switch to html handler if text/html comes before application/json in the Accept header
+	if htmlIdx != -1 && (jsonIdx == -1 || htmlIdx < jsonIdx) {
+		h = htmlHandler
+	}
+	return h
+}
+
+func newManualBlockDataHandler(ct string, template []byte) func(headers map[string][]string) (map[string][]string, []byte) {
+	return func(headers map[string][]string) (map[string][]string, []byte) {
+		return map[string][]string{"Content-Type": {ct}}, template
 	}
 }
 
@@ -226,4 +275,76 @@ func redirectParamsFromMap(params map[string]any) (redirectActionParams, error) 
 	var p redirectActionParams
 	err := mapstructure.WeakDecode(params, &p)
 	return p, err
+}
+
+// HandleRedirectLocationString returns the headers and body to be written to the response when a redirect is needed
+// Vendored from net/http/server.go
+func HandleRedirectLocationString(oldpath string, url string, statusCode int, method string, h map[string][]string) (map[string][]string, []byte) {
+	if u, err := urlpkg.Parse(url); err == nil {
+		// If url was relative, make its path absolute by
+		// combining with request path.
+		// The client would probably do this for us,
+		// but doing it ourselves is more reliable.
+		// See RFC 7231, section 7.1.2
+		if u.Scheme == "" && u.Host == "" {
+			if oldpath == "" { // should not happen, but avoid a crash if it does
+				oldpath = "/"
+			}
+
+			// no leading http://server
+			if url == "" || url[0] != '/' {
+				// make relative path absolute
+				olddir, _ := path.Split(oldpath)
+				url = olddir + url
+			}
+
+			var query string
+			if i := strings.Index(url, "?"); i != -1 {
+				url, query = url[:i], url[i:]
+			}
+
+			// clean up but preserve trailing slash
+			trailing := strings.HasSuffix(url, "/")
+			url = path.Clean(url)
+			if trailing && !strings.HasSuffix(url, "/") {
+				url += "/"
+			}
+			url += query
+		}
+	}
+
+	// RFC 7231 notes that a short HTML body is usually included in
+	// the response because older user agents may not understand 301/307.
+	// Do it only if the request didn't already have a Content-Type header.
+	_, hadCT := h["content-type"]
+	newHeaders := make(map[string][]string, 2)
+
+	newHeaders["location"] = []string{url}
+	if !hadCT && (method == "GET" || method == "HEAD") {
+		newHeaders["content-length"] = []string{"text/html; charset=utf-8"}
+	}
+
+	// Shouldn't send the body for POST or HEAD; that leaves GET.
+	var body []byte
+	if !hadCT && method == "GET" {
+		body = []byte("<a href=\"" + htmlEscape(url) + "\">" + http.StatusText(statusCode) + "</a>.\n")
+	}
+
+	return newHeaders, body
+}
+
+// Vendored from net/http/server.go
+var htmlReplacer = strings.NewReplacer(
+	"&", "&amp;",
+	"<", "&lt;",
+	">", "&gt;",
+	// "&#34;" is shorter than "&quot;".
+	`"`, "&#34;",
+	// "&#39;" is shorter than "&apos;" and apos was not in HTML until HTML5.
+	"'", "&#39;",
+)
+
+// htmlEscape escapes special characters like "<" to become "&lt;".
+func htmlEscape(s string) string {
+	return htmlReplacer.Replace(s)
 }

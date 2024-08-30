@@ -217,6 +217,7 @@ func (l *wafEventListener) onEvent(op *types.Operation, args types.HandlerOperat
 
 		// Log the attacks if any
 		if wafResult.HasEvents() {
+			shared.ProcessActions(op, wafResult.Actions)
 			log.Debug("appsec: attack detected by the waf")
 			shared.AddSecurityEvents(&op.SecurityEventsHolder, l.limiter, wafResult.Events)
 		}

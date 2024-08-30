@@ -12,6 +12,7 @@ package httpsec
 
 import (
 	"context"
+	"net/url"
 
 	// Blank import needed to use embed for the default blocked response payloads
 	_ "embed"
@@ -80,7 +81,7 @@ func WrapHandler(handler http.Handler, span ddtrace.Span, pathParams map[string]
 		var bypassHandler http.Handler
 		var blocking bool
 		var stackTrace *stacktrace.Event
-		args := MakeHandlerOperationArgs(r, clientIP, pathParams)
+		args := MakeHandlerOperationArgsFromRequest(r, clientIP, pathParams)
 		ctx, op := StartOperation(r.Context(), args, func(op *types.Operation) {
 			dyngo.OnData(op, func(a *sharedsec.HTTPAction) {
 				blocking = true
@@ -116,8 +117,8 @@ func WrapHandler(handler http.Handler, span ddtrace.Span, pathParams map[string]
 			// Add the request headers span tags out of args.Headers instead of r.Header as it was normalized and some
 			// extra headers have been added such as the Host header which is removed from the original Go request headers
 			// map
-			setRequestHeadersTags(span, args.Headers)
-			setResponseHeadersTags(span, opts.ResponseHeaderCopier(w))
+			SetRequestHeadersTags(span, args.Headers)
+			SetResponseHeadersTags(span, opts.ResponseHeaderCopier(w))
 			trace.SetTags(span, op.Tags())
 			if len(events) > 0 {
 				httptrace.SetSecurityEventsTags(span, events)
@@ -132,8 +133,8 @@ func WrapHandler(handler http.Handler, span ddtrace.Span, pathParams map[string]
 	})
 }
 
-// MakeHandlerOperationArgs creates the HandlerOperationArgs value.
-func MakeHandlerOperationArgs(r *http.Request, clientIP netip.Addr, pathParams map[string]string) types.HandlerOperationArgs {
+// MakeHandlerOperationArgsFromRequest creates the HandlerOperationArgs value from the given HTTP request.
+func MakeHandlerOperationArgsFromRequest(r *http.Request, clientIP netip.Addr, pathParams map[string]string) types.HandlerOperationArgs {
 	cookies := makeCookies(r) // TODO(Julio-Guerra): avoid actively parsing the cookies thanks to dynamic instrumentation
 	headers := headersRemoveCookies(r.Header)
 	headers["host"] = []string{r.Host}
@@ -146,6 +147,22 @@ func MakeHandlerOperationArgs(r *http.Request, clientIP netip.Addr, pathParams m
 		PathParams: pathParams,
 		ClientIP:   clientIP,
 	}
+}
+
+// MakeHandlerOperationArgs creates the HandlerOperationArgs value.
+func MakeHandlerOperationArgs(headers map[string][]string, method string, host string, clientIp netip.Addr, url *url.URL) types.HandlerOperationArgs {
+	args := types.HandlerOperationArgs{
+		Method:     method,
+		RequestURI: url.RequestURI(),
+		Headers:    headersRemoveCookies(headers),
+		Cookies:    makeCookiesFromHeaders(headers),
+		Query:      url.Query(),
+		PathParams: map[string]string{},
+		ClientIP:   clientIp,
+	}
+
+	args.Headers["host"] = []string{host}
+	return args
 }
 
 // MakeHandlerOperationRes creates the HandlerOperationRes value.
@@ -181,6 +198,24 @@ func makeCookies(r *http.Request) map[string][]string {
 	cookies := make(map[string][]string, len(parsed))
 	for _, c := range parsed {
 		cookies[c.Name] = append(cookies[c.Name], c.Value)
+	}
+	return cookies
+}
+
+func makeCookiesFromHeaders(headers map[string][]string) map[string][]string {
+	cookieHeader, ok := headers["cookie"]
+	if !ok {
+		return nil
+	}
+	cookies := make(map[string][]string, len(cookieHeader))
+	for _, c := range cookieHeader {
+		parts := strings.Split(c, ";")
+		for _, part := range parts {
+			cookie := strings.Split(part, "=")
+			if len(cookie) == 2 {
+				cookies[cookie[0]] = append(cookies[cookie[0]], cookie[1])
+			}
+		}
 	}
 	return cookies
 }

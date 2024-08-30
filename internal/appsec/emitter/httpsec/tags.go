@@ -10,13 +10,13 @@ import (
 	"gopkg.in/DataDog/dd-trace-go.v1/internal/appsec/trace/httptrace"
 )
 
-// setRequestHeadersTags sets the AppSec-specific request headers span tags.
-func setRequestHeadersTags(span trace.TagSetter, headers map[string][]string) {
+// SetRequestHeadersTags sets the AppSec-specific request headers span tags.
+func SetRequestHeadersTags(span trace.TagSetter, headers map[string][]string) {
 	setHeadersTags(span, "http.request.headers.", headers)
 }
 
-// setResponseHeadersTags sets the AppSec-specific response headers span tags.
-func setResponseHeadersTags(span trace.TagSetter, headers map[string][]string) {
+// SetResponseHeadersTags sets the AppSec-specific response headers span tags.
+func SetResponseHeadersTags(span trace.TagSetter, headers map[string][]string) {
 	setHeadersTags(span, "http.response.headers.", headers)
 }
 

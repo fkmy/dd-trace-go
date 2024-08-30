@@ -108,8 +108,8 @@ func TestTags(t *testing.T) {
 						return
 					}
 					require.NoError(t, err)
-					setRequestHeadersTags(&span, reqHeadersCase.headers)
-					setResponseHeadersTags(&span, respHeadersCase.headers)
+					SetRequestHeadersTags(&span, reqHeadersCase.headers)
+					SetResponseHeadersTags(&span, respHeadersCase.headers)
 
 					if eventCase.events != nil {
 						testlib.RequireContainsMapSubset(t, span.Tags, map[string]interface{}{
